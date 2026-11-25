@@ -245,6 +245,19 @@ def end_call(
             return cursor.rowcount > 0
 
 
+def assign_call_lead(
+    call_id: int,
+    lead_id: int,
+    db_path: Path | str | None = None,
+) -> bool:
+    """Link an existing call record to a newly created or matched lead ID."""
+    query = "UPDATE calls SET lead_id = ? WHERE id = ?"
+    with closing(get_connection(db_path)) as conn:
+        with conn:
+            cursor = conn.execute(query, (lead_id, call_id))
+            return cursor.rowcount > 0
+
+
 # --- Messages CRUD ---
 
 

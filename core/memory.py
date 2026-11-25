@@ -19,6 +19,7 @@ def create_empty_lead_state() -> dict[str, Any]:
 def merge_lead_state(
     current_state: dict[str, Any] | None,
     extracted: dict[str, Any] | None,
+    wants_booking: bool = False,
 ) -> dict[str, Any]:
     """Merge newly extracted non-empty lead fields into the existing lead_state."""
     merged = create_empty_lead_state()
@@ -26,6 +27,8 @@ def merge_lead_state(
         for key in EXTRACTED_KEYS:
             if current_state.get(key):
                 merged[key] = current_state[key]
+        if current_state.get("wants_booking"):
+            merged["wants_booking"] = True
 
     if extracted:
         for key in EXTRACTED_KEYS:
@@ -35,6 +38,8 @@ def merge_lead_state(
                 value = value.strip() or None
             if value is not None:
                 merged[key] = value
+    if wants_booking:
+        merged["wants_booking"] = True
     return merged
 
 
@@ -50,6 +55,12 @@ def init_conversation_memory(
         state["transcript"] = []
         state["memory_summary"] = ""
         state["lead_state"] = create_empty_lead_state()
+        state["lead_id"] = None
+        state["lead_score"] = 0
+        state["lead_status"] = "Cold"
+        state["lead_breakdown"] = []
+        state["sentiment_history"] = []
+        state["intents"] = []
         state["last_tts_audio"] = b""
         state["last_language"] = "en"
         state["last_intent"] = None
@@ -58,6 +69,12 @@ def init_conversation_memory(
         state.setdefault("transcript", [])
         state.setdefault("memory_summary", "")
         state.setdefault("lead_state", create_empty_lead_state())
+        state.setdefault("lead_id", None)
+        state.setdefault("lead_score", 0)
+        state.setdefault("lead_status", "Cold")
+        state.setdefault("lead_breakdown", [])
+        state.setdefault("sentiment_history", [])
+        state.setdefault("intents", [])
         state.setdefault("last_intent", None)
     return int(state["call_id"])
 
@@ -96,8 +113,12 @@ def record_message(
         "intent": intent,
         "sources": sources or [],
     }
-    if intent:
-        state["last_intent"] = intent
+    if role == "user":
+        if sentiment_score is not None:
+            state["sentiment_history"].append(float(sentiment_score))
+        if intent:
+            state["last_intent"] = intent
+            state["intents"].append(intent)
     state["transcript"].append(entry)
     state["llm_history"].append({"role": role, "text": text})
 
@@ -117,8 +138,13 @@ def record_message(
 def update_session_lead_state(
     state: MutableMapping[str, Any],
     extracted: dict[str, Any] | None,
+    wants_booking: bool = False,
 ) -> dict[str, Any]:
     """Merge extracted turn entities into state['lead_state'] and return the updated dict."""
-    updated = merge_lead_state(state.get("lead_state"), extracted)
+    updated = merge_lead_state(
+        state.get("lead_state"),
+        extracted,
+        wants_booking=wants_booking,
+    )
     state["lead_state"] = updated
     return updated

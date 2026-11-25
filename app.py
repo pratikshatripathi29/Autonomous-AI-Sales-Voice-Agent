@@ -7,8 +7,10 @@ from pathlib import Path
 
 import streamlit as st
 
+from core.analytics import build_score_gauge, build_sentiment_trend_figure
 from core.config import COMPANY_NAME, KNOWLEDGE_DIR, configure_logging, get_config_status
 from core.db import init_db
+from core.leads import get_score_breakdown, score_lead, sync_lead_to_db
 from core.llm import generate_turn, rewrite_search_query
 from core.memory import (
     init_conversation_memory,
@@ -38,6 +40,15 @@ def _format_sentiment_badge(sentiment: str | None, score: float | None) -> str:
     if label == "negative":
         return f":red[Sentiment: Negative{score_text}]"
     return f":gray[Sentiment: Neutral{score_text}]"
+
+
+def _format_lead_status_badge(status: str) -> str:
+    """Return a prominent colored Hot/Warm/Cold badge for the live lead panel."""
+    if status == "Hot":
+        return ":red-background[HOT LEAD]"
+    if status == "Warm":
+        return ":orange-background[WARM LEAD]"
+    return ":blue-background[COLD LEAD]"
 
 
 def _handle_knowledge_sidebar() -> None:
@@ -86,7 +97,7 @@ def _handle_knowledge_sidebar() -> None:
 
 
 def _process_voice_turn(audio_bytes: bytes) -> bool:
-    """Run STT -> RAG -> LLM -> memory/SQLite -> TTS for new audio."""
+    """Run STT -> RAG -> LLM -> Lead Scoring/SQLite -> TTS for new audio."""
     audio_hash = hashlib.sha256(audio_bytes).hexdigest()
     # Skip STT/LLM/TTS API calls when Streamlit reruns with the exact same audio bytes.
     if audio_hash == st.session_state.get("last_audio_hash"):
@@ -137,13 +148,36 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
         sentiment_score=turn["sentiment_score"],
         intent=turn["intent"],
     )
-    update_session_lead_state(st.session_state, turn.get("extracted"))
+    updated_lead = update_session_lead_state(
+        st.session_state,
+        turn.get("extracted"),
+        wants_booking=bool(turn.get("wants_booking")),
+    )
+
+    score, status = score_lead(
+        updated_lead,
+        sentiment_history=st.session_state.get("sentiment_history", []),
+        intents=st.session_state.get("intents", []),
+    )
+    st.session_state["lead_score"] = score
+    st.session_state["lead_status"] = status
+    st.session_state["lead_breakdown"] = get_score_breakdown(
+        updated_lead,
+        sentiment_history=st.session_state.get("sentiment_history", []),
+        intents=st.session_state.get("intents", []),
+    )
+    sync_lead_to_db(
+        st.session_state,
+        score=score,
+        status=status,
+        language=detected_lang,
+    )
 
     reply_text = turn["reply"]
     reply_lang = turn.get("language") or detected_lang
     sources_payload = [
-        {"source": source, "score": score, "text": chunk_text}
-        for chunk_text, source, score in hits
+        {"source": source, "score": score_val, "text": chunk_text}
+        for chunk_text, source, score_val in hits
     ]
     record_message(
         st.session_state,
@@ -195,8 +229,58 @@ def _render_transcript() -> None:
                             st.caption(item["text"])
 
 
+def _render_live_lead_panel() -> None:
+    """Render the right-hand live lead card, Plotly score gauge, badge, and sentiment trend."""
+    score = int(st.session_state.get("lead_score", 0))
+    status = str(st.session_state.get("lead_status", "Cold"))
+    lead_state = st.session_state.get("lead_state", {})
+    breakdown = st.session_state.get("lead_breakdown", [])
+    sentiment_history = st.session_state.get("sentiment_history", [])
+
+    st.subheader("Live Lead Intelligence")
+    st.markdown(_format_lead_status_badge(status))
+    if st.session_state.get("lead_id"):
+        st.caption(f"Saved Lead ID: `{st.session_state['lead_id']}`")
+
+    st.plotly_chart(build_score_gauge(score, status), use_container_width=True)
+
+    with st.expander("Score Breakdown", expanded=True):
+        if not breakdown:
+            st.caption("No qualification signals detected yet.")
+        else:
+            for reason in breakdown:
+                st.write(f"- {reason}")
+
+    with st.container(border=True):
+        st.markdown("**Lead Card**")
+        display_fields = [
+            ("Name", lead_state.get("name")),
+            ("Email", lead_state.get("email")),
+            ("Phone", lead_state.get("phone")),
+            ("Company", lead_state.get("company")),
+            ("Need", lead_state.get("need")),
+            ("Budget", lead_state.get("budget")),
+            ("Timeline", lead_state.get("timeline")),
+        ]
+        for label, value in display_fields:
+            st.write(f"**{label}:** {value or '—'}")
+
+    if sentiment_history:
+        st.plotly_chart(
+            build_sentiment_trend_figure(sentiment_history),
+            use_container_width=True,
+        )
+    else:
+        st.caption("Sentiment trend will appear after your first spoken turn.")
+
+    memory_summary = st.session_state.get("memory_summary", "")
+    if memory_summary:
+        st.subheader("Rolling Memory Summary")
+        st.write(memory_summary)
+
+
 def render_voice_agent_page() -> None:
-    """Render the Voice Agent page with recording, transcript, TTS playback, and lead state."""
+    """Render the Voice Agent page with recording, transcript, TTS playback, and live lead panel."""
     init_conversation_memory(st.session_state)
 
     header_col, action_col = st.columns([4, 1])
@@ -225,18 +309,13 @@ def render_voice_agent_page() -> None:
         # Autoplay only on the turn where new audio arrived; keep player visible on reruns.
         st.audio(tts_bytes, format="audio/mp3", autoplay=is_new_audio)
 
-    chat_col, state_col = st.columns([2, 1])
+    chat_col, state_col = st.columns([3, 2])
     with chat_col:
         st.subheader("Conversation Transcript")
         _render_transcript()
 
     with state_col:
-        st.subheader("Captured Lead State")
-        st.json(st.session_state.get("lead_state", {}))
-        memory_summary = st.session_state.get("memory_summary", "")
-        if memory_summary:
-            st.subheader("Rolling Memory Summary")
-            st.write(memory_summary)
+        _render_live_lead_panel()
 
 
 def render_leads_appointments_page() -> None:

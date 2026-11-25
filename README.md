@@ -54,4 +54,14 @@ Modular Python MVP for an autonomous AI sales voice agent built with Streamlit, 
 - `app.py`: Added sidebar knowledge-doc file uploader (`.md`/`.txt`) + **Rebuild knowledge base** button, wired query rewriting + RAG retrieval into each voice turn, and rendered a **Sources used** expander under each AI reply.
 - `tests/test_rag.py`: Unit tests for FAISS index build/load/retrieval, context formatting, and query rewriting.
 
+## Stage 5: Lead Scoring, Sentiment Tracking & Live Panel
+
+### Modules Added / Updated
+- `core/leads.py`: Transparent rule-based `score_lead(lead_state, sentiment_history, intents) -> (score, status)` (`Hot >= 70`, `Warm 40-69`, `Cold < 40`), `get_score_breakdown(...)` returning human-readable scoring reasons, and `sync_lead_to_db(...)` creating a SQLite lead on first captured name/phone/email and updating it on subsequent turns.
+- `core/db.py`: Added `assign_call_lead(call_id, lead_id)` to link active calls when a lead is created mid-call.
+- `core/memory.py`: Tracks `sentiment_history`, `intents`, `wants_booking`, `lead_id`, `lead_score`, `lead_status`, and `lead_breakdown` per call session.
+- `core/analytics.py`: Added Plotly `build_score_gauge(score, status)` and `build_sentiment_trend_figure(sentiment_history)` builders.
+- `app.py`: Added a right-hand **Live Lead Intelligence** panel on the `Voice Agent` page displaying the Hot/Warm/Cold badge, Plotly score gauge, score breakdown, collected lead card, and turn-by-turn Plotly sentiment trend line.
+- `tests/test_leads.py`: Unit tests covering scoring rules, negative sentiment penalty, 0-100 clamping, SQLite lead create/update sync, and Plotly chart generation.
+
 
