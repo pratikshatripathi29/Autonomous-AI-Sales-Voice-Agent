@@ -64,6 +64,8 @@ def init_conversation_memory(
         state["last_tts_audio"] = b""
         state["last_language"] = "en"
         state["last_intent"] = None
+        state["last_booking"] = None
+        state["last_call_summary"] = None
     else:
         state.setdefault("llm_history", [])
         state.setdefault("transcript", [])
@@ -76,6 +78,8 @@ def init_conversation_memory(
         state.setdefault("sentiment_history", [])
         state.setdefault("intents", [])
         state.setdefault("last_intent", None)
+        state.setdefault("last_booking", None)
+        state.setdefault("last_call_summary", None)
     return int(state["call_id"])
 
 

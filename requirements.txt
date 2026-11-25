@@ -10,4 +10,5 @@ gTTS==2.5.4
 plotly==7.1.0
 pandas==2.3.3
 requests==2.34.2
+dateparser==1.5.1
 

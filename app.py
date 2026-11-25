@@ -5,11 +5,38 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
-from core.analytics import build_score_gauge, build_sentiment_trend_figure
-from core.config import COMPANY_NAME, KNOWLEDGE_DIR, configure_logging, get_config_status
-from core.db import init_db
+from core.analytics import (
+    aggregate_objections_and_pain_points,
+    build_calls_per_day_chart,
+    build_conversion_funnel,
+    build_language_distribution_chart,
+    build_lead_status_pie,
+    build_score_gauge,
+    build_sentiment_over_time_chart,
+    build_sentiment_trend_figure,
+    build_top_issues_chart,
+    compute_kpis,
+    generate_business_insights,
+    load_analytics_data,
+)
+from core.booking import generate_ics, process_booking_request
+from core.config import (
+    COMPANY_NAME,
+    CRM_MODE,
+    KNOWLEDGE_DIR,
+    configure_logging,
+    get_config_status,
+)
+from core.crm import sync_lead
+from core.db import (
+    get_crm_sync_logs,
+    init_db,
+    list_appointments,
+    list_leads,
+)
 from core.leads import get_score_breakdown, score_lead, sync_lead_to_db
 from core.llm import generate_turn, rewrite_search_query
 from core.memory import (
@@ -19,6 +46,7 @@ from core.memory import (
 )
 from core.rag import build_index, format_context, retrieve
 from core.stt import transcribe
+from core.summary import summarize_call
 from core.tts import normalize_lang_code, speak
 
 
@@ -86,7 +114,7 @@ def _handle_knowledge_sidebar() -> None:
             else:
                 st.sidebar.warning("Files saved, but index rebuild failed. Check logs.")
 
-    if st.sidebar.button("Rebuild knowledge base", use_container_width=True):
+    if st.sidebar.button("Rebuild knowledge base", width="stretch"):
         with st.sidebar:
             with st.spinner("Rebuilding FAISS index..."):
                 built = build_index()
@@ -97,7 +125,7 @@ def _handle_knowledge_sidebar() -> None:
 
 
 def _process_voice_turn(audio_bytes: bytes) -> bool:
-    """Run STT -> RAG -> LLM -> Lead Scoring/SQLite -> TTS for new audio."""
+    """Run STT -> RAG -> LLM -> Lead Scoring -> Booking -> CRM Sync -> TTS for new audio."""
     audio_hash = hashlib.sha256(audio_bytes).hexdigest()
     # Skip STT/LLM/TTS API calls when Streamlit reruns with the exact same audio bytes.
     if audio_hash == st.session_state.get("last_audio_hash"):
@@ -166,7 +194,7 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
         sentiment_history=st.session_state.get("sentiment_history", []),
         intents=st.session_state.get("intents", []),
     )
-    sync_lead_to_db(
+    lead_id = sync_lead_to_db(
         st.session_state,
         score=score,
         status=status,
@@ -175,6 +203,38 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
 
     reply_text = turn["reply"]
     reply_lang = turn.get("language") or detected_lang
+
+    # Execute slot validation/booking when the customer wants to schedule a demo.
+    if turn.get("wants_booking") or (
+        turn.get("preferred_time") and st.session_state.get("lead_state", {}).get("wants_booking")
+    ):
+        booking_outcome = process_booking_request(
+            lead_id=lead_id,
+            call_id=st.session_state.get("call_id"),
+            lead_state=updated_lead,
+            preferred_time_text=turn.get("preferred_time"),
+            user_text=user_text,
+        )
+        reply_text = booking_outcome["message"]
+        if booking_outcome["status"] == "booked":
+            booking_info = booking_outcome["booking"]
+            st.session_state["last_booking"] = booking_info
+            if lead_id is not None:
+                sync_lead(
+                    {
+                        "id": lead_id,
+                        "score": score,
+                        "status": status,
+                        "appointment": {
+                            "slot_start": booking_info["slot_start"],
+                            "slot_end": booking_info["slot_end"],
+                            "status": "booked",
+                        },
+                        "summary": st.session_state.get("memory_summary", ""),
+                    },
+                    mode=CRM_MODE,
+                )
+
     sources_payload = [
         {"source": source, "score": score_val, "text": chunk_text}
         for chunk_text, source, score_val in hits
@@ -193,6 +253,99 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
     st.session_state["last_tts_audio"] = tts_bytes
     st.session_state["last_language"] = reply_lang
     return True
+
+
+def _handle_end_call() -> None:
+    """Trigger summary -> final lead score -> CRM sync -> store summary card."""
+    call_id = st.session_state.get("call_id")
+    if call_id is None:
+        return
+    if not st.session_state.get("transcript"):
+        st.warning("Record at least one conversation turn before ending the call.")
+        return
+
+    with st.spinner("Generating post-call summary..."):
+        summary_data = summarize_call(int(call_id))
+
+    lead_state = st.session_state.get("lead_state", {})
+    sentiment_history = st.session_state.get("sentiment_history", [])
+    intents = st.session_state.get("intents", [])
+
+    final_score, final_status = score_lead(
+        lead_state,
+        sentiment_history=sentiment_history,
+        intents=intents,
+    )
+    st.session_state["lead_score"] = final_score
+    st.session_state["lead_status"] = final_status
+    st.session_state["lead_breakdown"] = get_score_breakdown(
+        lead_state,
+        sentiment_history=sentiment_history,
+        intents=intents,
+    )
+
+    lead_id = sync_lead_to_db(
+        st.session_state,
+        score=final_score,
+        status=final_status,
+        language=st.session_state.get("last_language", "en"),
+    )
+
+    crm_status = "skipped (no contact details captured)"
+    if lead_id is not None:
+        sync_result = sync_lead(
+            {
+                "id": int(lead_id),
+                "score": final_score,
+                "status": final_status,
+                "summary": summary_data["summary"],
+            },
+            mode=CRM_MODE,
+        )
+        crm_status = sync_result["status"]
+
+    st.session_state["last_call_summary"] = {
+        **summary_data,
+        "final_score": final_score,
+        "final_status": final_status,
+        "crm_status": crm_status,
+    }
+
+
+def _render_post_call_summary_card(summary_data: dict) -> None:
+    """Render the structured post-call summary card on the Voice Agent page."""
+    with st.container(border=True):
+        st.subheader("Post-Call Summary Card")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Outcome", str(summary_data.get("outcome", "follow_up")).title())
+        col2.metric(
+            "Overall Sentiment",
+            str(summary_data.get("overall_sentiment", "neutral")).title(),
+        )
+        col3.metric(
+            "Final Lead Score",
+            f"{summary_data.get('final_score', 0)} ({summary_data.get('final_status', 'Cold')})",
+        )
+
+        st.markdown(f"**Summary:** {summary_data.get('summary', '')}")
+        st.markdown(f"**Recommended Action:** {summary_data.get('recommended_action', '')}")
+        st.caption(f"CRM Sync: `{summary_data.get('crm_status', 'not synced')}`")
+
+        list_col1, list_col2 = st.columns(2)
+        with list_col1:
+            st.markdown("**Key Points**")
+            for item in summary_data.get("key_points") or ["None"]:
+                st.write(f"- {item}")
+            st.markdown("**Customer Pain Points**")
+            for item in summary_data.get("customer_pain_points") or ["None"]:
+                st.write(f"- {item}")
+        with list_col2:
+            st.markdown("**Objections**")
+            for item in summary_data.get("objections") or ["None"]:
+                st.write(f"- {item}")
+            st.markdown("**Next Steps**")
+            for item in summary_data.get("next_steps") or ["None"]:
+                st.write(f"- {item}")
 
 
 def _render_transcript() -> None:
@@ -236,13 +389,24 @@ def _render_live_lead_panel() -> None:
     lead_state = st.session_state.get("lead_state", {})
     breakdown = st.session_state.get("lead_breakdown", [])
     sentiment_history = st.session_state.get("sentiment_history", [])
+    last_booking = st.session_state.get("last_booking")
 
     st.subheader("Live Lead Intelligence")
     st.markdown(_format_lead_status_badge(status))
     if st.session_state.get("lead_id"):
         st.caption(f"Saved Lead ID: `{st.session_state['lead_id']}`")
 
-    st.plotly_chart(build_score_gauge(score, status), use_container_width=True)
+    st.plotly_chart(build_score_gauge(score, status), width="stretch")
+
+    if last_booking:
+        st.success(f"Demo Booked: {last_booking['label']}")
+        st.download_button(
+            "Download Calendar Invite (.ics)",
+            data=last_booking["ics"],
+            file_name=f"demo_{last_booking['appointment_id']}.ics",
+            mime="text/calendar",
+            width="stretch",
+        )
 
     with st.expander("Score Breakdown", expanded=True):
         if not breakdown:
@@ -268,7 +432,7 @@ def _render_live_lead_panel() -> None:
     if sentiment_history:
         st.plotly_chart(
             build_sentiment_trend_figure(sentiment_history),
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.caption("Sentiment trend will appear after your first spoken turn.")
@@ -280,21 +444,29 @@ def _render_live_lead_panel() -> None:
 
 
 def render_voice_agent_page() -> None:
-    """Render the Voice Agent page with recording, transcript, TTS playback, and live lead panel."""
+    """Render the Voice Agent page with recording, End Call summary, transcript, and live lead panel."""
     init_conversation_memory(st.session_state)
 
-    header_col, action_col = st.columns([4, 1])
+    header_col, end_col, new_col = st.columns([3, 1, 1])
     with header_col:
         st.header(f"{COMPANY_NAME} — Voice Agent")
         st.caption(f"Active Call ID: `{st.session_state.get('call_id')}`")
-    with action_col:
-        if st.button("New Call", use_container_width=True):
+    with end_col:
+        if st.button("End Call", width="stretch"):
+            _handle_end_call()
+    with new_col:
+        if st.button("New Call", width="stretch"):
             init_conversation_memory(st.session_state, force_reset=True)
             st.session_state.pop("last_audio_hash", None)
             st.session_state.pop("last_stt_empty", None)
+            # Rotate the st.audio_input key so stale recorded audio does not replay on rerun.
+            st.session_state["audio_widget_nonce"] = (
+                int(st.session_state.get("audio_widget_nonce", 0)) + 1
+            )
             st.rerun()
 
-    audio_file = st.audio_input("Record your message")
+    audio_widget_key = f"voice_audio_input_{st.session_state.get('audio_widget_nonce', 0)}"
+    audio_file = st.audio_input("Record your message", key=audio_widget_key)
     is_new_audio = False
     if audio_file is not None:
         audio_bytes = audio_file.getvalue()
@@ -309,6 +481,10 @@ def render_voice_agent_page() -> None:
         # Autoplay only on the turn where new audio arrived; keep player visible on reruns.
         st.audio(tts_bytes, format="audio/mp3", autoplay=is_new_audio)
 
+    summary_card = st.session_state.get("last_call_summary")
+    if summary_card:
+        _render_post_call_summary_card(summary_card)
+
     chat_col, state_col = st.columns([3, 2])
     with chat_col:
         st.subheader("Conversation Transcript")
@@ -319,15 +495,162 @@ def render_voice_agent_page() -> None:
 
 
 def render_leads_appointments_page() -> None:
-    """Render the placeholder Leads & Appointments page."""
+    """Render interactive Leads, Appointments, and CRM Sync Log tables with filters and exports."""
     st.header("Leads & Appointments")
-    st.info("Lead qualification table, appointment calendar, and CRM sync logs will appear here.")
+
+    leads_rows = list_leads()
+    appt_rows = list_appointments()
+    crm_rows = get_crm_sync_logs()
+
+    leads_df = pd.DataFrame(leads_rows)
+    appts_df = pd.DataFrame(appt_rows)
+    crm_df = pd.DataFrame(crm_rows)
+
+    st.subheader("Leads")
+    filter_col1, filter_col2 = st.columns([1, 2])
+    with filter_col1:
+        status_filter = st.selectbox("Filter by Status", options=["All", "Hot", "Warm", "Cold"])
+    with filter_col2:
+        search_text = st.text_input("Search Name, Email, or Company", placeholder="Type to filter...")
+
+    filtered_leads_df = leads_df.copy()
+    if not filtered_leads_df.empty:
+        if status_filter != "All":
+            filtered_leads_df = filtered_leads_df[filtered_leads_df["status"] == status_filter]
+        if search_text.strip():
+            term = search_text.strip().lower()
+            mask = (
+                filtered_leads_df["name"].fillna("").str.lower().str.contains(term)
+                | filtered_leads_df["email"].fillna("").str.lower().str.contains(term)
+                | filtered_leads_df["company"].fillna("").str.lower().str.contains(term)
+            )
+            filtered_leads_df = filtered_leads_df[mask]
+
+    st.dataframe(filtered_leads_df, width="stretch")
+    if not filtered_leads_df.empty:
+        st.download_button(
+            "Download Leads CSV",
+            data=filtered_leads_df.to_csv(index=False).encode("utf-8"),
+            file_name="leads_export.csv",
+            mime="text/csv",
+        )
+
+    st.divider()
+    st.subheader("Appointments")
+    appt_status_filter = st.selectbox(
+        "Filter Appointments by Status",
+        options=["All", "booked", "cancelled"],
+    )
+    filtered_appts_df = appts_df.copy()
+    if not filtered_appts_df.empty and appt_status_filter != "All":
+        filtered_appts_df = filtered_appts_df[filtered_appts_df["status"] == appt_status_filter]
+
+    st.dataframe(filtered_appts_df, width="stretch")
+    if not filtered_appts_df.empty:
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                "Download Appointments CSV",
+                data=filtered_appts_df.to_csv(index=False).encode("utf-8"),
+                file_name="appointments_export.csv",
+                mime="text/csv",
+            )
+        with dl_col2:
+            first_appt = filtered_appts_df.iloc[0]
+            ics_data = generate_ics(
+                slot_start=str(first_appt["slot_start"]),
+                slot_end=str(first_appt["slot_end"]),
+                uid=f"appt-{first_appt['id']}@novacloud.ai",
+            )
+            st.download_button(
+                f"Download Latest .ics (Appt #{first_appt['id']})",
+                data=ics_data,
+                file_name=f"appointment_{first_appt['id']}.ics",
+                mime="text/calendar",
+            )
+
+    st.divider()
+    st.subheader("CRM Sync Log")
+    if not leads_df.empty:
+        sync_col1, sync_col2 = st.columns([2, 1])
+        with sync_col1:
+            lead_options = {
+                f"#{row['id']} — {row['name']} ({row['status']})": int(row["id"])
+                for _, row in leads_df.iterrows()
+            }
+            selected_label = st.selectbox("Select Lead for Manual CRM Sync", options=list(lead_options.keys()))
+        with sync_col2:
+            st.write("")
+            st.write("")
+            if st.button("Sync Lead Now", width="stretch"):
+                result = sync_lead({"id": lead_options[selected_label]}, mode=CRM_MODE)
+                if result["ok"]:
+                    st.success(f"Synced ({result['status']})")
+                    st.rerun()
+                else:
+                    st.warning(f"Sync status: {result['status']}")
+
+    st.dataframe(crm_df, width="stretch")
+    if not crm_df.empty:
+        st.download_button(
+            "Download CRM Sync Log CSV",
+            data=crm_df.to_csv(index=False).encode("utf-8"),
+            file_name="crm_sync_log.csv",
+            mime="text/csv",
+        )
 
 
 def render_analytics_page() -> None:
-    """Render the placeholder Analytics page."""
-    st.header("Analytics")
-    st.info("Plotly charts for call outcomes, lead scores, and sentiment trends will appear here.")
+    """Render the Plotly executive analytics dashboard and AI business insights."""
+    st.header("Sales Analytics & Business Insights")
+
+    data = load_analytics_data()
+    kpis = compute_kpis(data)
+    issues = aggregate_objections_and_pain_points(data["calls"])
+
+    kpi_cols = st.columns(6)
+    kpi_cols[0].metric("Total Calls", kpis["total_calls"])
+    kpi_cols[1].metric("Total Leads", kpis["total_leads"])
+    kpi_cols[2].metric("Hot Leads %", f"{kpis['hot_leads_pct']:.1f}%")
+    kpi_cols[3].metric("Booked Demos", kpis["appointments_booked"])
+    kpi_cols[4].metric("Conversion Rate", f"{kpis['conversion_rate']:.1f}%")
+    kpi_cols[5].metric("Avg Sentiment", f"{kpis['avg_sentiment']:+.2f}")
+
+    st.divider()
+    row1_col1, row1_col2 = st.columns(2)
+    with row1_col1:
+        st.plotly_chart(build_conversion_funnel(kpis), width="stretch")
+    with row1_col2:
+        st.plotly_chart(build_lead_status_pie(data["leads"]), width="stretch")
+
+    row2_col1, row2_col2 = st.columns(2)
+    with row2_col1:
+        st.plotly_chart(
+            build_sentiment_over_time_chart(data["calls"], data["messages"]),
+            width="stretch",
+        )
+    with row2_col2:
+        st.plotly_chart(build_calls_per_day_chart(data["calls"]), width="stretch")
+
+    row3_col1, row3_col2 = st.columns(2)
+    with row3_col1:
+        st.plotly_chart(
+            build_language_distribution_chart(data["messages"], data["leads"]),
+            width="stretch",
+        )
+    with row3_col2:
+        st.plotly_chart(build_top_issues_chart(issues), width="stretch")
+
+    st.divider()
+    st.subheader("AI Business Insights")
+    if st.button("AI business insights", type="primary"):
+        with st.spinner("Analyzing pipeline metrics with Gemini..."):
+            st.session_state["ai_business_insights"] = generate_business_insights(data)
+
+    insights = st.session_state.get("ai_business_insights")
+    if insights:
+        for idx, insight in enumerate(insights, start=1):
+            st.info(f"**{idx}.** {insight}")
 
 
 def main() -> None:
@@ -353,6 +676,7 @@ def main() -> None:
     st.sidebar.caption("Environment Status")
     st.sidebar.write(f"Gemini Key: {'OK' if status['gemini_configured'] else 'Missing'}")
     st.sidebar.write(f"Groq Key: {'OK' if status['groq_configured'] else 'Missing'}")
+    st.sidebar.write(f"CRM Mode: `{CRM_MODE}`")
 
     if page == "Voice Agent":
         render_voice_agent_page()

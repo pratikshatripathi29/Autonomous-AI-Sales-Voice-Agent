@@ -117,15 +117,21 @@ def _parse_turn_json(raw_text: str, default_lang: str) -> dict[str, Any]:
     if not cleaned:
         return _default_turn_response(language=default_lang)
 
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return _normalize_turn_payload(parsed, default_lang=default_lang)
-        logger.warning("LLM returned non-object JSON (%s); using plain fallback.", type(parsed))
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse LLM JSON output; falling back to plain text reply.")
+    candidates = [cleaned]
+    # Also try extracting an embedded JSON object if Gemini prefixed/suffixed prose.
+    brace_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if brace_match and brace_match.group(0) != cleaned:
+        candidates.append(brace_match.group(0))
 
-    # Strip accidental quotes/braces only if needed; otherwise speak the plain text directly.
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return _normalize_turn_payload(parsed, default_lang=default_lang)
+        except json.JSONDecodeError:
+            continue
+
+    logger.warning("Failed to parse LLM JSON output; falling back to plain text reply.")
     return _default_turn_response(reply=cleaned, language=default_lang)
 
 

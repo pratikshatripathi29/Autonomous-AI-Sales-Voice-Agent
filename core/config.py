@@ -27,13 +27,16 @@ GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001").strip()
 GROQ_WHISPER_MODEL: str = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip()
 CRM_WEBHOOK_URL: str = os.getenv("CRM_WEBHOOK_URL", "").strip()
+CRM_MODE: str = os.getenv("CRM_MODE", "local").strip().lower()
+CRM_EXPORT_PATH: Path = Path(os.getenv("CRM_EXPORT_PATH", str(DATA_DIR / "crm_export.csv")))
+TIMEZONE_NAME: str = os.getenv("TIMEZONE_NAME", "Asia/Kolkata").strip()
 
 COMPANY_NAME: str = os.getenv("COMPANY_NAME", "NovaCloud AI").strip()
 COMPANY_PRODUCTS: str = os.getenv(
     "COMPANY_PRODUCTS",
     "AI Voice Receptionist, Automated Lead Qualifier, Smart Demo Scheduler",
 ).strip()
-MEMORY_WINDOW_SIZE: int = int(os.getenv("MEMORY_WINDOW_SIZE", "10"))
+MEMORY_WINDOW_SIZE: int = int(os.getenv("MEMORY_WINDOW_SIZE") or "10")
 
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 

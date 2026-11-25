@@ -295,6 +295,14 @@ def get_call_messages(
         return [dict(row) for row in rows]
 
 
+def list_all_messages(db_path: Path | str | None = None) -> list[dict[str, Any]]:
+    """Return all persisted messages across all calls ordered chronologically."""
+    query = "SELECT * FROM messages ORDER BY id ASC"
+    with closing(get_connection(db_path)) as conn:
+        rows = conn.execute(query).fetchall()
+        return [dict(row) for row in rows]
+
+
 # --- Appointments CRUD ---
 
 

@@ -1,67 +1,86 @@
 # Autonomous AI Sales Voice Agent
 
-Modular Python MVP for an autonomous AI sales voice agent built with Streamlit, Groq Whisper (STT), Google Gemini (LLM), gTTS (TTS), LangChain + FAISS (RAG), SQLite, and Plotly.
+An end-to-end, modular Python MVP for an autonomous multilingual AI sales voice agent built with **Streamlit**, **Groq Whisper (STT)**, **Google Gemini (LLM & Embeddings)**, **LangChain + FAISS (RAG)**, **gTTS (TTS)**, **SQLite**, and **Plotly**.
 
-## Stage 1: Project Scaffold & SQLite Layer
+## Architecture & Documentation
+- [Architecture & Sequence Diagrams](docs/architecture.md)
+- [Scalability Strategy (100,000 Users)](docs/scalability.md)
+- [Security & Privacy Review](docs/security.md)
+- [Cost Model & Optimization](docs/costs.md)
 
-### Structure
-- `app.py`: Streamlit UI shell with sidebar navigation (`Voice Agent`, `Leads & Appointments`, `Analytics`) and startup database initialization.
-- `core/config.py`: Loads `.env` via `python-dotenv`, exposes configuration constants, and configures logging.
-- `core/db.py`: Pure `sqlite3` persistence layer (no ORM) managing `leads`, `calls`, `messages`, `appointments`, and `crm_sync_log` with parameterized queries.
-- `core/*.py`: Module stubs reserved for upcoming stages (`stt.py`, `tts.py`, `llm.py`, `rag.py`, `memory.py`, `leads.py`, `booking.py`, `crm.py`, `summary.py`, `analytics.py`).
-- `data/knowledge/`, `data/db/`: Local storage directories for knowledge documents and the SQLite database.
-- `tests/test_db.py`: Unit tests for database schema and CRUD helpers.
+## Project Structure
+- `app.py` — Streamlit UI only (3 pages: **Voice Agent**, **Leads & Appointments**, **Analytics**).
+- `core/` — Single-concern modules:
+  - `config.py`: `.env` configuration & logging
+  - `db.py`: Pure `sqlite3` schema & parameterized CRUD (`leads`, `calls`, `messages`, `appointments`, `crm_sync_log`)
+  - `stt.py`: Groq Whisper auto-detect speech-to-text (`en`, `hi`, `pa`, etc.)
+  - `tts.py`: `gTTS` in-memory MP3 synthesis with language mapping
+  - `rag.py`: LangChain + FAISS local index build/load and top-k retrieval
+  - `llm.py`: Gemini JSON-mode turn generation, contextual query rewriting, and summarization
+  - `memory.py`: Rolling `N=10` window + memory summary compression + `lead_state` merge
+  - `leads.py`: Transparent rule-based 0–100 lead scoring (`Hot`/`Warm`/`Cold`) & SQLite sync
+  - `booking.py`: `Asia/Kolkata` slot parser (`dateparser`), `BEGIN IMMEDIATE` double-booking guard, `.ics` export
+  - `crm.py`: Pluggable CRM sync (`local` SQLite/CSV export or `webhook` POST with retries)
+  - `summary.py`: Structured post-call Gemini JSON summary saved to `calls`
+  - `analytics.py`: KPIs, 6 Plotly dashboard charts, live gauge/trend widgets, and AI business insights
+- `data/knowledge/` — Starter `.md` product & FAQ docs for RAG.
+- `scripts/seed_demo_data.py` — Seeds 30 realistic leads/calls/messages/appointments across 14 days.
+- `tests/` — Unit and `pytest` tests (`test_core.py`, `test_db.py`, `test_voice_io.py`, `test_brain.py`, `test_rag.py`, `test_leads.py`, `test_booking_crm.py`, `test_summary_analytics.py`).
 
-### Setup & Verification
-1. Install dependencies (ideally in a virtual environment):
-   ```bash
+## Setup & Installation
+
+1. Create and activate a Python virtual environment (recommended):
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
+2. Install pinned dependencies:
+   ```powershell
    pip install -r requirements.txt
    ```
-2. Run database tests:
-   ```bash
-   python -m unittest discover -s tests -v
+3. Configure `.env` in the project root:
+   ```env
+   GEMINI_API_KEY=your_gemini_api_key
+   GROQ_API_KEY=your_groq_api_key
+   GEMINI_MODEL=gemini-2.5-flash
+   EMBEDDING_MODEL=gemini-embedding-001
+   # Optional overrides:
+   # COMPANY_NAME=NovaCloud AI
+   # CRM_MODE=local
+   # CRM_WEBHOOK_URL=https://example.com/webhook
    ```
-3. Launch the Streamlit app:
-   ```bash
+
+## Running the App & Tests
+
+1. **Seed 14 days of realistic demo data** (optional, makes dashboards immediately rich):
+   ```powershell
+   python scripts/seed_demo_data.py --reset
+   ```
+2. **Run the full test suite**:
+   ```powershell
+   pytest -v
+   ```
+3. **Launch Streamlit**:
+   ```powershell
    streamlit run app.py
    ```
 
-## Stage 2: Voice I/O (STT & TTS Echo Loop)
+## Live Interview Demo Script (3–5 Minutes)
 
-### Modules Added / Updated
-- `core/stt.py`: `transcribe(audio_bytes)` calls Groq Whisper (`whisper-large-v3-turbo`) with `response_format="verbose_json"` and automatic language detection (no forced language) for English, Hindi, Punjabi, and more, with empty-audio and error fallbacks.
-- `core/tts.py`: `speak(text, lang_code)` synthesizes MP3 bytes into an in-memory `BytesIO` buffer using `gTTS`, mapping Whisper language names/codes (`english` -> `en`, `hindi` -> `hi`, `punjabi` -> `pa`) with fallback to `en`.
-- `app.py`: Voice Agent page records microphone audio via `st.audio_input`, caches the SHA-256 hash in `st.session_state` to prevent duplicate API calls across reruns, displays the transcript and detected language, and echoes it back via `st.audio(..., autoplay=True)`.
-- `tests/test_voice_io.py`: Mocked unit tests for STT auto-detection, error fallbacks, language mapping, and in-memory TTS generation.
-
-## Stage 3: Conversational Brain & Rolling Memory
-
-### Modules Added / Updated
-- `core/config.py`: Added `COMPANY_NAME`, `COMPANY_PRODUCTS`, and `MEMORY_WINDOW_SIZE` (default `10`).
-- `core/llm.py`: Uses `langchain_google_genai.ChatGoogleGenerativeAI` (`GEMINI_MODEL`) to implement `generate_turn(...)` returning structured JSON (`reply`, `language`, `sentiment`, `sentiment_score`, `intent`, `extracted`, `wants_booking`, `preferred_time`) with code-fence stripping and plain-text fallback, plus `summarize_messages(...)` for memory compression.
-- `core/memory.py`: Persists every message to SQLite `messages`, maintains a rolling 10-message LLM context window with automatic summarization of older turns into `memory_summary`, and merges newly extracted lead fields into `st.session_state["lead_state"]`.
-- `app.py`: Wired full `record -> STT -> generate_turn -> memory/SQLite -> TTS` loop on the `Voice Agent` page, displaying chat messages with sentiment badges, intent tags, captured lead state, and rolling memory summary.
-- `tests/test_brain.py`: Unit tests for JSON parsing/clamping, fallback behavior, rolling memory summarization, lead state merging, and SQLite message persistence.
-
-## Stage 4: RAG Knowledge Base (LangChain + FAISS)
-
-### Modules Added / Updated
-- `core/config.py`: Added `FAISS_INDEX_DIR` (`data/faiss_index`).
-- `core/rag.py`: Implements `build_index()` (loads `.md`/`.txt` from `data/knowledge/` via `DirectoryLoader`/`TextLoader`, chunks via `RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)`, embeds with `GoogleGenerativeAIEmbeddings`, saves FAISS index locally), `load_index()` (loads existing index or builds on demand), `retrieve(query, k=3)` returning `(text, source, score)` tuples, and `format_context()`.
-- `data/knowledge/`: Added starter docs `products_and_pricing.md` and `faq_and_support.md`.
-- `core/llm.py`: Added `rewrite_search_query(user_text, history, last_intent)` so short follow-ups like `"how much?"` expand with the previous user turn and intent before RAG retrieval, and injected retrieved context into `generate_turn()`.
-- `core/memory.py`: Tracks `last_intent` and stores retrieved `sources` on assistant transcript entries.
-- `app.py`: Added sidebar knowledge-doc file uploader (`.md`/`.txt`) + **Rebuild knowledge base** button, wired query rewriting + RAG retrieval into each voice turn, and rendered a **Sources used** expander under each AI reply.
-- `tests/test_rag.py`: Unit tests for FAISS index build/load/retrieval, context formatting, and query rewriting.
-
-## Stage 5: Lead Scoring, Sentiment Tracking & Live Panel
-
-### Modules Added / Updated
-- `core/leads.py`: Transparent rule-based `score_lead(lead_state, sentiment_history, intents) -> (score, status)` (`Hot >= 70`, `Warm 40-69`, `Cold < 40`), `get_score_breakdown(...)` returning human-readable scoring reasons, and `sync_lead_to_db(...)` creating a SQLite lead on first captured name/phone/email and updating it on subsequent turns.
-- `core/db.py`: Added `assign_call_lead(call_id, lead_id)` to link active calls when a lead is created mid-call.
-- `core/memory.py`: Tracks `sentiment_history`, `intents`, `wants_booking`, `lead_id`, `lead_score`, `lead_status`, and `lead_breakdown` per call session.
-- `core/analytics.py`: Added Plotly `build_score_gauge(score, status)` and `build_sentiment_trend_figure(sentiment_history)` builders.
-- `app.py`: Added a right-hand **Live Lead Intelligence** panel on the `Voice Agent` page displaying the Hot/Warm/Cold badge, Plotly score gauge, score breakdown, collected lead card, and turn-by-turn Plotly sentiment trend line.
-- `tests/test_leads.py`: Unit tests covering scoring rules, negative sentiment penalty, 0-100 clamping, SQLite lead create/update sync, and Plotly chart generation.
-
-
+1. **Pre-demo check (30s)**:
+   - Run `python scripts/seed_demo_data.py --reset` and `streamlit run app.py`.
+   - Confirm sidebar **Environment Status** shows `Gemini Key: OK` and `Groq Key: OK`.
+   - Click **Rebuild knowledge base** in the sidebar to verify `data/faiss_index` builds from `data/knowledge/`.
+2. **Live Multilingual Voice + RAG Turn (90s)**:
+   - On **Voice Agent**, record: *"Hi, I'm Aarav from Acme Tech. Can you tell me about your AI Voice Receptionist?"*
+   - Show the transcript, sentiment badge, intent tag, auto-played MP3 reply, and expand **Sources used** to show retrieved FAISS chunks.
+   - Follow up with a short query: *"How much does it cost?"* — point out contextual query rewriting retrieving `$49/month` / `$149/month` accurately.
+   - (Optional) Speak a turn in Hindi or Punjabi to demonstrate Whisper auto-detection + matching `gTTS` reply.
+3. **Lead Scoring & Appointment Booking (60s)**:
+   - Provide urgency/budget/contact: *"Our budget is $200 a month and we want to launch next month. Book a demo tomorrow at 3 PM, my email is aarav@acme.io."*
+   - Highlight the right-hand **Live Lead Intelligence** panel jumping to **Hot Lead**, the Plotly gauge, the transparent **Score Breakdown**, the confirmed slot, and the **.ics** calendar download button.
+4. **End Call & CRM Sync (30s)**:
+   - Click **End Call** to generate the structured **Post-Call Summary Card** (pain points, objections, next steps, recommended action) and auto-sync to `crm_sync_log` + `data/crm_export.csv`.
+5. **Leads & Analytics Dashboards (45s)**:
+   - Open **Leads & Appointments** to filter Hot leads, download CSVs, and inspect the CRM Sync Log.
+   - Open **Analytics** to show the 6 KPI cards, conversion funnel, language distribution, top objections/pain points, and click **AI business insights** for live Gemini recommendations.
