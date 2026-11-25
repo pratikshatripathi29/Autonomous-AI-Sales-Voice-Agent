@@ -45,7 +45,7 @@ from core.memory import (
     update_session_lead_state,
 )
 from core.rag import build_index, format_context, retrieve
-from core.stt import transcribe
+from core.stt import get_last_stt_error, transcribe
 from core.summary import summarize_call
 from core.tts import normalize_lang_code, speak
 
@@ -124,7 +124,7 @@ def _handle_knowledge_sidebar() -> None:
             st.sidebar.warning("Could not rebuild index (missing docs or GEMINI_API_KEY).")
 
 
-def _process_voice_turn(audio_bytes: bytes) -> bool:
+def _process_voice_turn(audio_bytes: bytes, filename: str = "audio.wav") -> bool:
     """Run STT -> RAG -> LLM -> Lead Scoring -> Booking -> CRM Sync -> TTS for new audio."""
     audio_hash = hashlib.sha256(audio_bytes).hexdigest()
     # Skip STT/LLM/TTS API calls when Streamlit reruns with the exact same audio bytes.
@@ -132,7 +132,7 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
         return False
 
     with st.spinner("Transcribing audio..."):
-        stt_result = transcribe(audio_bytes)
+        stt_result = transcribe(audio_bytes, filename=filename)
 
     user_text = stt_result.get("text", "").strip()
     detected_lang = stt_result.get("language", "en")
@@ -140,10 +140,12 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
     st.session_state["last_audio_hash"] = audio_hash
     if not user_text:
         st.session_state["last_stt_empty"] = True
+        st.session_state["last_stt_error"] = get_last_stt_error()
         st.session_state["last_tts_audio"] = b""
         return True
 
     st.session_state["last_stt_empty"] = False
+    st.session_state["last_stt_error"] = ""
     history = st.session_state.get("llm_history", [])
     last_intent = st.session_state.get("last_intent")
 
@@ -471,10 +473,12 @@ def render_voice_agent_page() -> None:
     if audio_file is not None:
         audio_bytes = audio_file.getvalue()
         if audio_bytes:
-            is_new_audio = _process_voice_turn(audio_bytes)
+            audio_name = getattr(audio_file, "name", None) or "audio.wav"
+            is_new_audio = _process_voice_turn(audio_bytes, filename=audio_name)
 
     if st.session_state.get("last_stt_empty"):
-        st.warning("Could not transcribe audio (empty speech or STT error). Check logs and GROQ_API_KEY.")
+        detail = st.session_state.get("last_stt_error") or "Empty speech or STT error."
+        st.warning(f"Could not transcribe audio: {detail}")
 
     tts_bytes = st.session_state.get("last_tts_audio", b"")
     if tts_bytes:

@@ -10,6 +10,12 @@ from groq import Groq
 from core.config import GROQ_API_KEY, GROQ_WHISPER_MODEL
 
 logger = logging.getLogger(__name__)
+_LAST_STT_ERROR: str = ""
+
+
+def get_last_stt_error() -> str:
+    """Return the most recent STT error message (empty string if last call succeeded)."""
+    return _LAST_STT_ERROR
 
 
 def _extract_language(response: Any) -> str:
@@ -26,11 +32,16 @@ def _extract_language(response: Any) -> str:
 
 def transcribe(audio_bytes: bytes, filename: str = "audio.wav") -> dict[str, str]:
     """Transcribe audio bytes via Groq Whisper with automatic language detection."""
+    global _LAST_STT_ERROR
+    _LAST_STT_ERROR = ""
+
     if not audio_bytes:
+        _LAST_STT_ERROR = "Empty audio recording received from microphone."
         logger.warning("Skipping STT transcription because audio_bytes is empty.")
         return {"text": "", "language": "en"}
 
     if not GROQ_API_KEY:
+        _LAST_STT_ERROR = "GROQ_API_KEY is missing (check .env or Streamlit Secrets)."
         logger.error("GROQ_API_KEY is missing; cannot call Groq Whisper API.")
         return {"text": "", "language": "en"}
 
@@ -44,7 +55,10 @@ def transcribe(audio_bytes: bytes, filename: str = "audio.wav") -> dict[str, str
         )
         text = (getattr(response, "text", "") or "").strip()
         language = _extract_language(response)
+        if not text:
+            _LAST_STT_ERROR = "Whisper returned an empty transcript (try speaking louder or longer)."
         return {"text": text, "language": language}
-    except Exception:
+    except Exception as exc:
+        _LAST_STT_ERROR = f"Groq Whisper API error: {exc}"
         logger.exception("Groq Whisper transcription failed.")
         return {"text": "", "language": "en"}

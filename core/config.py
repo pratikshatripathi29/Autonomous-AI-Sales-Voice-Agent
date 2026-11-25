@@ -18,27 +18,50 @@ FAISS_INDEX_DIR: Path = Path(os.getenv("FAISS_INDEX_DIR", str(DATA_DIR / "faiss_
 # Load .env explicitly from project root so secrets never rely on shell CWD.
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
-DB_PATH: Path = Path(os.getenv("DB_PATH", str(DB_DIR / "sales_agent.db")))
 
-GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
-GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "").strip()
+def _get_env_or_secret(key: str, default: str = "") -> str:
+    """Read config from OS/.env first, falling back to Streamlit Cloud st.secrets."""
+    env_val = os.getenv(key)
+    if env_val is not None and env_val.strip():
+        return env_val.strip()
 
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001").strip()
-GROQ_WHISPER_MODEL: str = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip()
-CRM_WEBHOOK_URL: str = os.getenv("CRM_WEBHOOK_URL", "").strip()
-CRM_MODE: str = os.getenv("CRM_MODE", "local").strip().lower()
-CRM_EXPORT_PATH: Path = Path(os.getenv("CRM_EXPORT_PATH", str(DATA_DIR / "crm_export.csv")))
-TIMEZONE_NAME: str = os.getenv("TIMEZONE_NAME", "Asia/Kolkata").strip()
+    try:
+        import streamlit as st
 
-COMPANY_NAME: str = os.getenv("COMPANY_NAME", "NovaCloud AI").strip()
-COMPANY_PRODUCTS: str = os.getenv(
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+        # Also support users who group secrets under a TOML section like [secrets] or [api].
+        for section_val in st.secrets.values():
+            if isinstance(section_val, dict) and key in section_val:
+                return str(section_val[key]).strip()
+    except Exception:
+        # Running outside Streamlit or without a secrets.toml file is expected locally.
+        pass
+
+    return default
+
+
+DB_PATH: Path = Path(_get_env_or_secret("DB_PATH", str(DB_DIR / "sales_agent.db")))
+
+GEMINI_API_KEY: str = _get_env_or_secret("GEMINI_API_KEY")
+GROQ_API_KEY: str = _get_env_or_secret("GROQ_API_KEY")
+
+GEMINI_MODEL: str = _get_env_or_secret("GEMINI_MODEL", "gemini-2.5-flash")
+EMBEDDING_MODEL: str = _get_env_or_secret("EMBEDDING_MODEL", "gemini-embedding-001")
+GROQ_WHISPER_MODEL: str = _get_env_or_secret("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+CRM_WEBHOOK_URL: str = _get_env_or_secret("CRM_WEBHOOK_URL")
+CRM_MODE: str = _get_env_or_secret("CRM_MODE", "local").lower()
+CRM_EXPORT_PATH: Path = Path(_get_env_or_secret("CRM_EXPORT_PATH", str(DATA_DIR / "crm_export.csv")))
+TIMEZONE_NAME: str = _get_env_or_secret("TIMEZONE_NAME", "Asia/Kolkata")
+
+COMPANY_NAME: str = _get_env_or_secret("COMPANY_NAME", "NovaCloud AI")
+COMPANY_PRODUCTS: str = _get_env_or_secret(
     "COMPANY_PRODUCTS",
     "AI Voice Receptionist, Automated Lead Qualifier, Smart Demo Scheduler",
-).strip()
-MEMORY_WINDOW_SIZE: int = int(os.getenv("MEMORY_WINDOW_SIZE") or "10")
+)
+MEMORY_WINDOW_SIZE: int = int(_get_env_or_secret("MEMORY_WINDOW_SIZE", "10") or "10")
 
-LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+LOG_LEVEL: str = _get_env_or_secret("LOG_LEVEL", "INFO").upper()
 
 SUPPORTED_LANGUAGES: dict[str, str] = {
     "en": "English",
