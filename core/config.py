@@ -13,6 +13,7 @@ BASE_DIR: Path = Path(__file__).resolve().parent.parent
 DATA_DIR: Path = BASE_DIR / "data"
 KNOWLEDGE_DIR: Path = DATA_DIR / "knowledge"
 DB_DIR: Path = DATA_DIR / "db"
+FAISS_INDEX_DIR: Path = Path(os.getenv("FAISS_INDEX_DIR", str(DATA_DIR / "faiss_index")))
 
 # Load .env explicitly from project root so secrets never rely on shell CWD.
 load_dotenv(dotenv_path=BASE_DIR / ".env")

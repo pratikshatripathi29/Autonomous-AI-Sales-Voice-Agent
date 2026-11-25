@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
 
 import streamlit as st
 
-from core.config import COMPANY_NAME, configure_logging, get_config_status
+from core.config import COMPANY_NAME, KNOWLEDGE_DIR, configure_logging, get_config_status
 from core.db import init_db
-from core.llm import generate_turn
+from core.llm import generate_turn, rewrite_search_query
 from core.memory import (
     init_conversation_memory,
     record_message,
     update_session_lead_state,
 )
+from core.rag import build_index, format_context, retrieve
 from core.stt import transcribe
 from core.tts import normalize_lang_code, speak
 
@@ -38,8 +40,53 @@ def _format_sentiment_badge(sentiment: str | None, score: float | None) -> str:
     return f":gray[Sentiment: Neutral{score_text}]"
 
 
+def _handle_knowledge_sidebar() -> None:
+    """Render sidebar controls to upload knowledge docs and rebuild the FAISS index."""
+    st.sidebar.divider()
+    st.sidebar.caption("Knowledge Base (RAG)")
+
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload Knowledge Docs (.md, .txt)",
+        type=["md", "txt"],
+        accept_multiple_files=True,
+    )
+    if uploaded_files:
+        processed_sigs = st.session_state.setdefault("uploaded_doc_sigs", set())
+        saved_names: list[str] = []
+        KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+        for uploaded in uploaded_files:
+            raw_bytes = uploaded.getvalue()
+            sig = f"{uploaded.name}:{hashlib.sha256(raw_bytes).hexdigest()}"
+            if sig in processed_sigs:
+                continue
+            # Use Path(name).name to avoid path traversal from uploaded filenames.
+            safe_name = Path(uploaded.name).name
+            target_path = KNOWLEDGE_DIR / safe_name
+            target_path.write_bytes(raw_bytes)
+            processed_sigs.add(sig)
+            saved_names.append(safe_name)
+
+        if saved_names:
+            with st.sidebar:
+                with st.spinner("Indexing uploaded docs..."):
+                    built = build_index()
+            if built is not None:
+                st.sidebar.success(f"Added & indexed: {', '.join(saved_names)}")
+            else:
+                st.sidebar.warning("Files saved, but index rebuild failed. Check logs.")
+
+    if st.sidebar.button("Rebuild knowledge base", use_container_width=True):
+        with st.sidebar:
+            with st.spinner("Rebuilding FAISS index..."):
+                built = build_index()
+        if built is not None:
+            st.sidebar.success("Knowledge base rebuilt.")
+        else:
+            st.sidebar.warning("Could not rebuild index (missing docs or GEMINI_API_KEY).")
+
+
 def _process_voice_turn(audio_bytes: bytes) -> bool:
-    """Run STT -> LLM -> memory/SQLite -> TTS for new audio, returning True if processed."""
+    """Run STT -> RAG -> LLM -> memory/SQLite -> TTS for new audio."""
     audio_hash = hashlib.sha256(audio_bytes).hexdigest()
     # Skip STT/LLM/TTS API calls when Streamlit reruns with the exact same audio bytes.
     if audio_hash == st.session_state.get("last_audio_hash"):
@@ -58,14 +105,27 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
         return True
 
     st.session_state["last_stt_empty"] = False
+    history = st.session_state.get("llm_history", [])
+    last_intent = st.session_state.get("last_intent")
+
+    with st.spinner("Searching knowledge base..."):
+        search_query = rewrite_search_query(
+            user_text=user_text,
+            history=history,
+            last_intent=last_intent,
+        )
+        hits = retrieve(search_query, k=3)
+        rag_context = format_context(hits)
+
     with st.spinner("Thinking..."):
         turn = generate_turn(
             user_text=user_text,
-            history=st.session_state.get("llm_history", []),
-            rag_context="",
+            history=history,
+            rag_context=rag_context,
             lead_state=st.session_state.get("lead_state", {}),
             detected_lang=detected_lang,
             memory_summary=st.session_state.get("memory_summary", ""),
+            last_intent=last_intent,
         )
 
     record_message(
@@ -81,11 +141,16 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
 
     reply_text = turn["reply"]
     reply_lang = turn.get("language") or detected_lang
+    sources_payload = [
+        {"source": source, "score": score, "text": chunk_text}
+        for chunk_text, source, score in hits
+    ]
     record_message(
         st.session_state,
         role="assistant",
         text=reply_text,
         language=reply_lang,
+        sources=sources_payload,
     )
 
     with st.spinner("Synthesizing voice reply..."):
@@ -97,7 +162,7 @@ def _process_voice_turn(audio_bytes: bytes) -> bool:
 
 
 def _render_transcript() -> None:
-    """Render the conversation transcript with sentiment badges and intent metadata."""
+    """Render the conversation transcript with sentiment badges and RAG sources."""
     transcript = st.session_state.get("transcript", [])
     if not transcript:
         st.info("Record a message above to start talking with the AI sales representative.")
@@ -118,6 +183,16 @@ def _render_transcript() -> None:
             else:
                 lang = msg.get("language") or "en"
                 st.caption(f"Lang: `{lang}` (TTS: `{normalize_lang_code(lang)}`)")
+                sources = msg.get("sources") or []
+                with st.expander("Sources used"):
+                    if not sources:
+                        st.write("No knowledge base sources matched this turn.")
+                    else:
+                        for item in sources:
+                            st.markdown(
+                                f"**{item['source']}** (distance: `{item['score']:.4f}`)"
+                            )
+                            st.caption(item["text"])
 
 
 def render_voice_agent_page() -> None:
@@ -190,6 +265,8 @@ def main() -> None:
         "Navigation",
         options=["Voice Agent", "Leads & Appointments", "Analytics"],
     )
+
+    _handle_knowledge_sidebar()
 
     # Show configuration readiness indicators without exposing secret values.
     status = get_config_status()

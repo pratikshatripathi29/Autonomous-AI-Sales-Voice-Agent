@@ -43,4 +43,15 @@ Modular Python MVP for an autonomous AI sales voice agent built with Streamlit, 
 - `app.py`: Wired full `record -> STT -> generate_turn -> memory/SQLite -> TTS` loop on the `Voice Agent` page, displaying chat messages with sentiment badges, intent tags, captured lead state, and rolling memory summary.
 - `tests/test_brain.py`: Unit tests for JSON parsing/clamping, fallback behavior, rolling memory summarization, lead state merging, and SQLite message persistence.
 
+## Stage 4: RAG Knowledge Base (LangChain + FAISS)
+
+### Modules Added / Updated
+- `core/config.py`: Added `FAISS_INDEX_DIR` (`data/faiss_index`).
+- `core/rag.py`: Implements `build_index()` (loads `.md`/`.txt` from `data/knowledge/` via `DirectoryLoader`/`TextLoader`, chunks via `RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)`, embeds with `GoogleGenerativeAIEmbeddings`, saves FAISS index locally), `load_index()` (loads existing index or builds on demand), `retrieve(query, k=3)` returning `(text, source, score)` tuples, and `format_context()`.
+- `data/knowledge/`: Added starter docs `products_and_pricing.md` and `faq_and_support.md`.
+- `core/llm.py`: Added `rewrite_search_query(user_text, history, last_intent)` so short follow-ups like `"how much?"` expand with the previous user turn and intent before RAG retrieval, and injected retrieved context into `generate_turn()`.
+- `core/memory.py`: Tracks `last_intent` and stores retrieved `sources` on assistant transcript entries.
+- `app.py`: Added sidebar knowledge-doc file uploader (`.md`/`.txt`) + **Rebuild knowledge base** button, wired query rewriting + RAG retrieval into each voice turn, and rendered a **Sources used** expander under each AI reply.
+- `tests/test_rag.py`: Unit tests for FAISS index build/load/retrieval, context formatting, and query rewriting.
+
 

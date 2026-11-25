@@ -16,6 +16,7 @@ from core.config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
 )
+from core.rag import format_context, retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -204,13 +205,60 @@ def _extract_response_text(response: Any) -> str:
     return str(content or "")
 
 
+def rewrite_search_query(
+    user_text: str,
+    history: list[dict[str, Any]] | None = None,
+    last_intent: str | None = None,
+) -> str:
+    """Rewrite short or follow-up user messages into standalone RAG search queries."""
+    cleaned = (user_text or "").strip()
+    if not cleaned:
+        return ""
+
+    last_user_turn = ""
+    for item in reversed(history or []):
+        if item.get("role") == "user" and str(item.get("text") or "").strip():
+            last_user_turn = str(item["text"]).strip()
+            break
+
+    # Skip LLM query rewriting on the opening turn when no prior context exists.
+    if not last_user_turn and not last_intent:
+        return cleaned
+
+    deterministic_fallback = " ".join(
+        part for part in (last_user_turn, last_intent or "", cleaned) if part
+    ).strip()
+
+    if not GEMINI_API_KEY:
+        return deterministic_fallback
+
+    prompt = (
+        "Rewrite the latest customer utterance into a concise standalone search query "
+        "(under 15 words) for searching product and pricing documentation.\n"
+        f"Previous customer turn: {last_user_turn or 'None'}\n"
+        f"Previous intent: {last_intent or 'None'}\n"
+        f"Latest customer utterance: {cleaned}\n"
+        "Return ONLY the rewritten search query."
+    )
+
+    try:
+        client = _create_chat_client(json_mode=False, temperature=0.0)
+        response = client.invoke([HumanMessage(content=prompt)])
+        rewritten = _extract_response_text(response).strip()
+        return rewritten or deterministic_fallback
+    except Exception:
+        logger.exception("Query rewrite failed; using deterministic contextual fallback.")
+        return deterministic_fallback
+
+
 def generate_turn(
     user_text: str,
     history: list[dict[str, Any]] | None = None,
-    rag_context: str = "",
+    rag_context: str | None = None,
     lead_state: dict[str, Any] | None = None,
     detected_lang: str = "en",
     memory_summary: str = "",
+    last_intent: str | None = None,
 ) -> dict[str, Any]:
     """Generate a structured sales agent turn using Gemini and return a normalized dict."""
     cleaned_input = (user_text or "").strip()
@@ -228,8 +276,18 @@ def generate_turn(
             language=detected_lang or "en",
         )
 
+    # Auto-retrieve when caller leaves rag_context as None; preserve explicit strings (even "").
+    resolved_context = rag_context
+    if resolved_context is None:
+        search_query = rewrite_search_query(
+            cleaned_input,
+            history=history,
+            last_intent=last_intent,
+        )
+        resolved_context = format_context(retrieve(search_query, k=3))
+
     system_prompt = _build_system_prompt(
-        rag_context=rag_context,
+        rag_context=resolved_context,
         lead_state=lead_state or {},
         detected_lang=detected_lang or "en",
         memory_summary=memory_summary,

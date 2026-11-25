@@ -52,11 +52,13 @@ def init_conversation_memory(
         state["lead_state"] = create_empty_lead_state()
         state["last_tts_audio"] = b""
         state["last_language"] = "en"
+        state["last_intent"] = None
     else:
         state.setdefault("llm_history", [])
         state.setdefault("transcript", [])
         state.setdefault("memory_summary", "")
         state.setdefault("lead_state", create_empty_lead_state())
+        state.setdefault("last_intent", None)
     return int(state["call_id"])
 
 
@@ -68,6 +70,7 @@ def record_message(
     sentiment_label: str | None = None,
     sentiment_score: float | None = None,
     intent: str | None = None,
+    sources: list[dict[str, Any]] | None = None,
     max_window: int = MEMORY_WINDOW_SIZE,
     db_path: Path | str | None = None,
 ) -> int:
@@ -91,7 +94,10 @@ def record_message(
         "sentiment": sentiment_label or "neutral",
         "sentiment_score": sentiment_score,
         "intent": intent,
+        "sources": sources or [],
     }
+    if intent:
+        state["last_intent"] = intent
     state["transcript"].append(entry)
     state["llm_history"].append({"role": role, "text": text})
 
